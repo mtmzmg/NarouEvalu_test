@@ -118,8 +118,8 @@ def load_master_data():
         query = f"""
             SELECT 
                 ncode, title, userid, writer, biggenre, genre, gensaku, keyword,
-                general_firstup, general_lastup, novel_type, end, general_all_no,
-                length, time, isstop, isr15, isbl, isgl, iszankoku, istensei, istenni,
+                general_firstup, general_lastup, novel_type, "end", general_all_no,
+                length, "time", isstop, isr15, isbl, isgl, iszankoku, istensei, istenni,
                 global_point, daily_point, weekly_point, monthly_point, quarter_point,
                 yearly_point, fav_novel_cnt, impression_cnt, review_cnt, all_point,
                 all_hyoka_cnt, sasie_cnt, kaiwaritu, novelupdated_at, updated_at,
