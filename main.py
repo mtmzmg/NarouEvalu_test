@@ -102,7 +102,9 @@ def load_master_data():
         return pd.DataFrame()
 
     # あらすじ(story)を除外して読み込む
-    query = """
+    # DuckDBのread_parquetでglobパターンを使う際、プレースホルダーだとエラーになる場合があるため直接埋め込む
+    safe_pattern = parquet_pattern.replace(os.sep, '/')
+    query = f"""
         SELECT 
             ncode, title, userid, writer, biggenre, genre, gensaku, keyword,
             general_firstup, general_lastup, novel_type, end, general_all_no,
@@ -111,12 +113,12 @@ def load_master_data():
             yearly_point, fav_novel_cnt, impression_cnt, review_cnt, all_point,
             all_hyoka_cnt, sasie_cnt, kaiwaritu, novelupdated_at, updated_at,
             weekly_unique
-        FROM read_parquet(?)
+        FROM read_parquet('{safe_pattern}')
     """
     
     # DuckDBで読み込み
     conn = duckdb.connect(database=':memory:')
-    df = conn.execute(query, [parquet_pattern]).df()
+    df = conn.execute(query).df()
     conn.close()
 
     if "genre" in df.columns:
@@ -1310,4 +1312,3 @@ def main_content(user_name):
     st.write("")       
 
 main_content(user_name)
-
