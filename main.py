@@ -1,7 +1,11 @@
 import streamlit as st
 import pandas as pd
-import os
+import gspread
+import json
 import time
+import os
+import duckdb
+import glob
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
@@ -88,39 +92,131 @@ supabase = init_supabase()
 
 @st.cache_data(ttl=7200)
 def load_master_data():
+    # Parquetファイルのパス設定（カレントディレクトリ基準で親フォルダを探す）
+    # Streamlit Cloudなどの環境に合わせてパスを調整してください
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    files = [
-        os.path.join(base_dir, "narou_novels_part1.parquet"),
-        os.path.join(base_dir, "narou_novels_part2.parquet"),
-        os.path.join(base_dir, "narou_novels_part3.parquet")
-    ]
-
-    dfs = []
-    for f in files:
-        if os.path.exists(f):
-            try:
-                dfs.append(pd.read_parquet(f))
-            except Exception as e:
-                print(f"Warning: {e}")
-                pass
+    parquet_pattern = os.path.join(base_dir, "narou_novels_part*.parquet")
     
-    if not dfs:
+    # Parquetファイルが見つからない場合は空のDataFrameを返す（またはエラー）
+    import glob
+    if not glob.glob(parquet_pattern):
+        st.error(f"データファイルが見つかりません: {parquet_pattern}")
         return pd.DataFrame()
 
-    df = pd.concat(dfs, ignore_index=True)
+    # あらすじ(story)を除外して読み込む
+    query = """
+        SELECT 
+            ncode, title, userid, writer, biggenre, genre, gensaku, keyword,
+            general_firstup, general_lastup, novel_type, end, general_all_no,
+            length, time, isstop, isr15, isbl, isgl, iszankoku, istensei, istenni,
+            global_point, daily_point, weekly_point, monthly_point, quarter_point,
+            yearly_point, fav_novel_cnt, impression_cnt, review_cnt, all_point,
+            all_hyoka_cnt, sasie_cnt, kaiwaritu, novelupdated_at, updated_at,
+            weekly_unique
+        FROM read_parquet(?)
+    """
+    
+    # DuckDBで読み込み
+    conn = duckdb.connect(database=':memory:')
+    df = conn.execute(query, [parquet_pattern]).df()
+    conn.close()
 
     if "genre" in df.columns:
         df["genre"] = df["genre"].astype(str).map(GENRE_MAP).fillna(df["genre"])
 
+    # 数値型への変換（Parquetなら本来不要だが念のため、あるいは欠損値処理）
     numeric_cols = ["global_point", "daily_point", "weekly_point", "monthly_point", 
                    "quarter_point", "yearly_point", "all_point", "general_all_no", 
                    "weekly_unique", "fav_novel_cnt", "impression_cnt", "review_cnt", "sasie_cnt", "kaiwaritu"]
     
     for col in numeric_cols:
         if col in df.columns:
+            # 文字列として読み込まれた場合の対策
+            if df[col].dtype == object:
+                df[col] = df[col].astype(str).str.replace(",", "", regex=False)
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
     return df
+
+@st.cache_data(ttl=3600)
+def load_novel_story(ncode):
+    """指定されたNコードのあらすじのみを取得する"""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    parquet_pattern = os.path.join(base_dir, "narou_novels_part*.parquet")
+    
+    query = "SELECT story FROM read_parquet(?) WHERE ncode = ?"
+    
+    try:
+        conn = duckdb.connect(database=':memory:')
+        result = conn.execute(query, [parquet_pattern, ncode]).fetchone()
+        conn.close()
+        
+        if result:
+            return result[0]
+    except Exception as e:
+        return f"あらすじ取得エラー: {str(e)}"
+        
+    return "情報なし"
+
+@st.cache_data(ttl=300)
+def search_ncodes_by_duckdb(search_keyword_str, exclude_keyword_str):
+    """
+    DuckDBを使ってParquetファイルから高速に検索を行い、
+    条件に合致するNコードのリストを返す。
+    メモリに全データを展開せずにあらすじ検索が可能。
+    """
+    if not search_keyword_str and not exclude_keyword_str:
+        return None
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    parquet_pattern = os.path.join(base_dir, "narou_novels_part*.parquet")
+    
+    # クエリ構築
+    query_parts = ["SELECT ncode FROM read_parquet(?) WHERE 1=1"]
+    params = [parquet_pattern]
+    
+    # 検索キーワード (AND条件)
+    if search_keyword_str:
+        keywords = search_keyword_str.replace("　", " ").split()
+        for k in keywords:
+            # タイトル、著者、あらすじ、タグ のいずれかにヒットすればOK
+            query_parts.append("""
+                AND (
+                    title ILIKE ? OR 
+                    writer ILIKE ? OR 
+                    story ILIKE ? OR 
+                    keyword ILIKE ?
+                )
+            """)
+            p = f"%{k}%"
+            params.extend([p, p, p, p])
+
+    # 除外キーワード (AND NOT条件)
+    if exclude_keyword_str:
+        ex_keywords = exclude_keyword_str.replace("　", " ").split()
+        for k in ex_keywords:
+            query_parts.append("""
+                AND NOT (
+                    title ILIKE ? OR 
+                    writer ILIKE ? OR 
+                    story ILIKE ? OR 
+                    keyword ILIKE ?
+                )
+            """)
+            p = f"%{k}%"
+            params.extend([p, p, p, p])
+            
+    full_query = " ".join(query_parts)
+    
+    try:
+        conn = duckdb.connect(database=':memory:')
+        result = conn.execute(full_query, params).fetchall()
+        conn.close()
+        # リストにして返す
+        return [r[0] for r in result]
+    except Exception as e:
+        st.error(f"検索エラー: {e}")
+        return []
 
 @st.cache_data(ttl=300)
 def load_user_ratings(user_name):
@@ -643,7 +739,8 @@ def render_novel_list(df_in, key_suffix):
     gb.configure_column("title", header_name="タイトル", width=670, wrapText=True, autoHeight=True, sortable=True)
     gb.configure_column("userid", hide=True)
     gb.configure_column("writer", header_name="著者", width=150, sortable=True)
-    gb.configure_column("story", hide=True)
+    if "story" in display_df.columns:
+        gb.configure_column("story", hide=True)
     gb.configure_column("biggenre", hide=True)
     gb.configure_column("genre", header_name="ジャンル", width=170, sortable=True)
     gb.configure_column("gensaku", hide=True)
@@ -776,27 +873,34 @@ def get_filtered_sorted_data(user_name, genre, search_keyword, exclude_keyword, 
     if genre != "すべて":
         df = df[df["genre"] == genre]
 
-    if search_keyword:
-        keywords = search_keyword.replace("　", " ").split()
-        for k in keywords:
-            mask = (
-                df["title"].fillna("").astype(str).str.contains(k, case=False, na=False) |
-                df["writer"].fillna("").astype(str).str.contains(k, case=False, na=False) |
-                df["story"].fillna("").astype(str).str.contains(k, case=False, na=False) |
-                df["keyword"].fillna("").astype(str).str.contains(k, case=False, na=False)
-            )
-            df = df[mask]
+    if search_keyword or exclude_keyword:
+        target_ncodes = search_ncodes_by_duckdb(search_keyword, exclude_keyword)
+        
+        # 検索結果がNoneでなければ（何らかの検索が行われていれば）絞り込み
+        if target_ncodes is not None:
+            df = df[df["ncode"].isin(target_ncodes)]
 
-    if exclude_keyword:
-        exclude_keywords = exclude_keyword.replace("　", " ").split()
-        for k in exclude_keywords:
-            mask_exclude = (
-                df["title"].fillna("").astype(str).str.contains(k, case=False, na=False) |
-                df["writer"].fillna("").astype(str).str.contains(k, case=False, na=False) |
-                df["story"].fillna("").astype(str).str.contains(k, case=False, na=False) |
-                df["keyword"].fillna("").astype(str).str.contains(k, case=False, na=False)
-            )
-            df = df[~mask_exclude]
+    # if search_keyword:
+    #     keywords = search_keyword.replace("　", " ").split()
+    #     for k in keywords:
+    #         mask = (
+    #             df["title"].fillna("").astype(str).str.contains(k, case=False, na=False) |
+    #             df["writer"].fillna("").astype(str).str.contains(k, case=False, na=False) |
+    #             # df["story"].fillna("").astype(str).str.contains(k, case=False, na=False) | # 軽量化のためあらすじ検索除外
+    #             df["keyword"].fillna("").astype(str).str.contains(k, case=False, na=False)
+    #         )
+    #         df = df[mask]
+
+    # if exclude_keyword:
+    #     exclude_keywords = exclude_keyword.replace("　", " ").split()
+    #     for k in exclude_keywords:
+    #         mask_exclude = (
+    #             df["title"].fillna("").astype(str).str.contains(k, case=False, na=False) |
+    #             df["writer"].fillna("").astype(str).str.contains(k, case=False, na=False) |
+    #             # df["story"].fillna("").astype(str).str.contains(k, case=False, na=False) | # 軽量化のためあらすじ検索除外
+    #             df["keyword"].fillna("").astype(str).str.contains(k, case=False, na=False)
+    #         )
+    #         df = df[~mask_exclude]
 
     if min_global is not None and min_global > 0:
         df = df[df["global_point"] >= min_global]
@@ -1139,9 +1243,13 @@ def main_content(user_name):
 
         with col_right:
             st.markdown('<div class="label" style="margin-bottom: 8px;">あらすじ</div>', unsafe_allow_html=True)
+            
+            # あらすじを都度取得（軽量化）
+            story_text = load_novel_story(row['ncode'])
+            
             st.markdown(f"""
             <div class="story-box" style="margin-bottom: 30px;">
-            {row.get("story", "情報なし").replace('\n', '<br>')}
+            {story_text.replace('\n', '<br>')}
             </div>
             """, unsafe_allow_html=True)
 
