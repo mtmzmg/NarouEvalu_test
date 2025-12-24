@@ -110,22 +110,33 @@ def load_master_data():
     # DuckDBで読み込み（複数ファイルをリストで渡す）
     conn = duckdb.connect(database=':memory:')
     
-    # ファイルリストをSQLのIN句形式で構築
-    file_list_str = ', '.join([f"'{f}'" for f in safe_files])
-    query = f"""
-        SELECT 
-            ncode, title, userid, writer, biggenre, genre, gensaku, keyword,
-            general_firstup, general_lastup, novel_type, end, general_all_no,
-            length, time, isstop, isr15, isbl, isgl, iszankoku, istensei, istenni,
-            global_point, daily_point, weekly_point, monthly_point, quarter_point,
-            yearly_point, fav_novel_cnt, impression_cnt, review_cnt, all_point,
-            all_hyoka_cnt, sasie_cnt, kaiwaritu, novelupdated_at, updated_at,
-            weekly_unique
-        FROM read_parquet([{file_list_str}])
-    """
-    
-    df = conn.execute(query).df()
-    conn.close()
+    try:
+        # ファイルリストを配列形式で構築（パス内のシングルクォートをエスケープ）
+        # DuckDBのread_parquetは配列を受け取る
+        escaped_files = [f.replace("'", "''") for f in safe_files]
+        file_list_str = ', '.join([f"'{f}'" for f in escaped_files])
+        query = f"""
+            SELECT 
+                ncode, title, userid, writer, biggenre, genre, gensaku, keyword,
+                general_firstup, general_lastup, novel_type, end, general_all_no,
+                length, time, isstop, isr15, isbl, isgl, iszankoku, istensei, istenni,
+                global_point, daily_point, weekly_point, monthly_point, quarter_point,
+                yearly_point, fav_novel_cnt, impression_cnt, review_cnt, all_point,
+                all_hyoka_cnt, sasie_cnt, kaiwaritu, novelupdated_at, updated_at,
+                weekly_unique
+            FROM read_parquet([{file_list_str}])
+        """
+        
+        df = conn.execute(query).df()
+    except Exception as e:
+        st.error(f"データ読み込みエラー: {str(e)}")
+        st.error(f"読み込み対象ファイル数: {len(safe_files)}")
+        if safe_files:
+            st.error(f"最初のファイルパス: {safe_files[0]}")
+        conn.close()
+        return pd.DataFrame()
+    finally:
+        conn.close()
 
     if "genre" in df.columns:
         df["genre"] = df["genre"].astype(str).map(GENRE_MAP).fillna(df["genre"])
