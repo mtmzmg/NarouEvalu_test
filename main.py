@@ -97,13 +97,21 @@ def load_master_data():
     
     # Parquetファイルが見つからない場合は空のDataFrameを返す（またはエラー）
     import glob
-    if not glob.glob(parquet_pattern):
+    parquet_files = glob.glob(parquet_pattern)
+    if not parquet_files:
         st.error(f"データファイルが見つかりません: {parquet_pattern}")
         return pd.DataFrame()
 
     # あらすじ(story)を除外して読み込む
-    # DuckDBのread_parquetでglobパターンを使う際、プレースホルダーだとエラーになる場合があるため直接埋め込む
-    safe_pattern = parquet_pattern.replace(os.sep, '/')
+    # DuckDBのread_parquetにファイルリストを渡す（globパターンは環境によって動作しない場合があるため）
+    # パスを正規化（Windows/Linux対応）
+    safe_files = [f.replace(os.sep, '/') for f in parquet_files]
+    
+    # DuckDBで読み込み（複数ファイルをリストで渡す）
+    conn = duckdb.connect(database=':memory:')
+    
+    # ファイルリストをSQLのIN句形式で構築
+    file_list_str = ', '.join([f"'{f}'" for f in safe_files])
     query = f"""
         SELECT 
             ncode, title, userid, writer, biggenre, genre, gensaku, keyword,
@@ -113,11 +121,9 @@ def load_master_data():
             yearly_point, fav_novel_cnt, impression_cnt, review_cnt, all_point,
             all_hyoka_cnt, sasie_cnt, kaiwaritu, novelupdated_at, updated_at,
             weekly_unique
-        FROM read_parquet('{safe_pattern}')
+        FROM read_parquet([{file_list_str}])
     """
     
-    # DuckDBで読み込み
-    conn = duckdb.connect(database=':memory:')
     df = conn.execute(query).df()
     conn.close()
 
@@ -144,11 +150,20 @@ def load_novel_story(ncode):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     parquet_pattern = os.path.join(base_dir, "narou_novels_part*.parquet")
     
-    query = "SELECT story FROM read_parquet(?) WHERE ncode = ?"
+    import glob
+    parquet_files = glob.glob(parquet_pattern)
+    if not parquet_files:
+        return "情報なし"
+    
+    # ファイルリストを正規化
+    safe_files = [f.replace(os.sep, '/') for f in parquet_files]
+    file_list_str = ', '.join([f"'{f}'" for f in safe_files])
+    
+    query = f"SELECT story FROM read_parquet([{file_list_str}]) WHERE ncode = ?"
     
     try:
         conn = duckdb.connect(database=':memory:')
-        result = conn.execute(query, [parquet_pattern, ncode]).fetchone()
+        result = conn.execute(query, [ncode]).fetchone()
         conn.close()
         
         if result:
@@ -171,9 +186,18 @@ def search_ncodes_by_duckdb(search_keyword_str, exclude_keyword_str):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     parquet_pattern = os.path.join(base_dir, "narou_novels_part*.parquet")
     
+    import glob
+    parquet_files = glob.glob(parquet_pattern)
+    if not parquet_files:
+        return None
+    
+    # ファイルリストを正規化
+    safe_files = [f.replace(os.sep, '/') for f in parquet_files]
+    file_list_str = ', '.join([f"'{f}'" for f in safe_files])
+    
     # クエリ構築
-    query_parts = ["SELECT ncode FROM read_parquet(?) WHERE 1=1"]
-    params = [parquet_pattern]
+    query_parts = [f"SELECT ncode FROM read_parquet([{file_list_str}]) WHERE 1=1"]
+    params = []
     
     # 検索キーワード (AND条件)
     if search_keyword_str:
